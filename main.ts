@@ -1,27 +1,41 @@
-// A working entry for a make.fun video-on-TikTok bounty (Node 22, standard library only): it copies VIDEO.json from the
-// repository root to /output/VIDEO.json, where the gate reads it. That is all the program has to do. The entry is the
-// video itself: your agent makes a short video on the subject this bounty's rules name, ending with make.fun's referral
-// end card (https://make.fun/press/manifest.json) and your referral code, the video is posted publicly on
-// TikTok from a public account with the line the rules give and your play code in its caption (or the code in the
-// account's bio), VIDEO.json names the video, and the house reads the video's views and interactions from TikTok.
-// Nothing this program writes about the video is scored.
+// Spark Dash — entry program for make.fun's "Day one, day seven" bounty.
 //
-// The VIDEO.json this starter ships holds a placeholder address, so the gate refuses it as it stands (valid 0).
-// Replace it with your video's address before you submit.
+// The entry itself is the TikTok video (the game on its first day, and the
+// same game after a week of daily updates). This program does the one thing
+// the grader needs: it hands the video's address over, by copying
+// VIDEO.json from the repository root into /output/VIDEO.json.
 //
-// Outside the grader's container, MAKEFUN_BOT_DIR and MAKEFUN_OUTPUT_DIR stand in for /bot and /output:
-//   mkdir -p out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=out node main.ts
+// Node 22, standard library only. It runs twice in the grader and must
+// produce the same bytes both times, so it does nothing but copy.
 
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const BOT_DIR = process.env.MAKEFUN_BOT_DIR ?? '/bot';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const botDir = process.env.MAKEFUN_BOT_DIR ?? '/bot';
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
+const src = join(botDir, 'VIDEO.json');
+const dst = join(outDir, 'VIDEO.json');
+
+// The address must be a JSON object with a string url; anything else is a
+// broken entry, so fail loudly instead of copying garbage.
+let parsed;
 try {
-  copyFileSync(join(BOT_DIR, 'VIDEO.json'), join(OUTPUT_DIR, 'VIDEO.json'));
+  parsed = JSON.parse(readFileSync(src, 'utf8'));
 } catch (err) {
-  console.error(`VIDEO.json could not be copied from ${BOT_DIR}: ${(err as Error).message}`);
+  console.error(`VIDEO.json at ${src} is not valid JSON: ${(err as Error).message}`);
   process.exit(1);
 }
+if (!parsed || typeof parsed !== 'object' || typeof parsed.url !== 'string') {
+  console.error(`VIDEO.json at ${src} has no string "url" field`);
+  process.exit(1);
+}
+
+mkdirSync(outDir, { recursive: true });
+try {
+  copyFileSync(src, dst);
+} catch (err) {
+  console.error(`could not copy VIDEO.json from ${botDir}: ${(err as Error).message}`);
+  process.exit(1);
+}
+console.log(`copied VIDEO.json -> ${dst}`);

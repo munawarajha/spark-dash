@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spark Dash</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #070a14; width: 1080px; height: 1920px; overflow: hidden; }
+  canvas { display: block; width: 1080px; height: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1080" height="1920"></canvas>
+<script>
+'use strict';
+// Spark Dash — a tiny top-down arena collector, written for the
+// make.fun "Day one, day seven" bounty. One map, one start, one scripted
+// autoplay driver, fully deterministic: the same seed, the same fixed
+// timestep, the same steering. ?v=1 is the day-one build (minimal),
+// ?v=2 is the day-seven build (same map and route, much more going on).
+// ?cam=still (default) is a fixed camera; ?cam=follow zooms on the player.
+// No network: no external resources of any kind.
+
+const params = new URLSearchParams(location.search);
+const VERSION = params.get('v') === '2' ? 2 : 1;
+const FOLLOW_CAM = params.get('cam') === 'follow';
+
+const W = 1080, H = 1920;
+// Arena: a 1000x1000 square, x 40..1040, y 400..1400.
+const AX = 40, AY = 400, AS = 1000;
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// --- deterministic RNG (mulberry32, fixed seed) ---
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(1337);
+
+// --- fixed timestep ---
+const STEP = 1 / 60;
+let acc = 0, last = performance.now(), frame = 0, gameTime = 0;
+
+// --- helpers ---
+function dist(ax, ay, bx, by) { const dx = ax - bx, dy = ay - by; return Math.sqrt(dx * dx + dy * dy); }
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// --- stars: wave layouts drawn from the seeded RNG in a fixed order,
+// so version 1's 5 stars are exactly version 2's first 5 stars. ---
+function starWave(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push({
+      x: AX + 70 + rng() * (AS - 140),
+      y: AY + 70 + rng() * (AS - 140),
+      r: 16 + rng() * 6,
+      hue: rng(),
+      taken: false,
+      pulse: rng() * Math.PI * 2
+    });
+  }
+  return out;
+}
+const STAR_COUNT = VERSION === 2 ? 20 : 5;
+let stars = starWave(STAR_COUNT);
+let wave = 0;
+
+// --- chasers: version 1 has one slow chaser; version 2 has five. ---
+// The first chaser is identical in both versions.
+const CHASER_SPAWNS = [
+  { x: AX + 60, y: AY + 60, speed: 62 },
+  { x: AX + AS - 60, y: AY + 60, speed: 78 },
+  { x: AX + 60, y: AY + AS - 60, speed: 88 },
+  { x: AX + AS - 60, y: AY + AS - 60, speed: 96 },
+  { x: AX + AS / 2, y: AY + 60, speed: 104 }
+];
+const CHASER_COLORS = ['#ef4444', '#f97316', '#a855f7', '#ec4899', '#eab308'];
+const chasers = [];
+const nChasers = VERSION === 2 ? 5 : 1;
+for (let i = 0; i < nChasers; i++) {
+  chasers.push({ x: CHASER_SPAWNS[i].x, y: CHASER_SPAWNS[i].y, speed: CHASER_SPAWNS[i].speed, spawn: i, flash: 0 });
+}
+
+// --- power-ups (version 2 only), fixed times and places ---
+const powerups = [
+  { kind: '2X', x: AX + 200, y: AY + 800, at: 8, active: false, taken: false, until: 0 },
+  { kind: 'SHIELD', x: AX + 800, y: AY + 300, at: 16, active: false, taken: false, until: 0 }
+];
+
+// --- decorations (version 2 only): static crystals and pillars ---
+const decor = [];
+if (VERSION === 2) {
+  for (let i = 0; i < 14; i++) {
+    decor.push({ x: AX + 60 + rng() * (AS - 120), y: AY + 60 + rng() * (AS - 120), s: 8 + rng() * 14, c: rng() });
+  }
+}
+
+// --- player: same start, same route, same steering in both versions ---
+const player = { x: AX + AS / 2, y: AY + AS - 120, r: 22, speed: 220, angle: -Math.PI / 2, flash: 0, invuln: 0, dashT: 0, dashCd: 0 };
+let score = 0, collected = 0, combo = 0, comboT = 0, mult = 1, shield = false;
+let particles = [];
+let hits = 0;
+
+// --- sound (version 2 only): tiny WebAudio bleeps, no assets ---
+let audioCtx = null;
+function beep(freq, dur) {
+  if (VERSION !== 2) return;
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.05, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch (e) { /* headless has no audio; the game plays on regardless */ }
+}
+
+function nearestStar() {
+  let best = null, bd = Infinity;
+  for (const s of stars) {
+    if (s.taken) continue;
+    const d = dist(player.x, player.y, s.x, s.y);
+    if (d < bd) { bd = d; best = s; }
+  }
+  return best;
+}
+
+function update() {
+  frame++;
+  gameTime += STEP;
+
+  // combo timer
+  if (comboT > 0) { comboT -= STEP; if (comboT <= 0) { combo = 0; mult = 1; } }
+  // 2X timer
+  const px2 = powerups[0];
+  if (px2.taken && gameTime > px2.until) { mult = combo > 0 ? 1 + combo * 0.1 : 1; }
+
+  // power-up spawns (v2)
+  if (VERSION === 2) {
+    for (const p of powerups) {
+      if (!p.active && !p.taken && gameTime >= p.at) p.active = true;
+    }
+  }
+
+  // steering: seek the nearest star, always the same rule
+  const target = nearestStar();
+  let sp = player.speed;
+  if (VERSION === 2) {
+    player.dashCd -= STEP;
+    if (player.dashCd <= 0) { player.dashT = 0.4; player.dashCd = 4; }
+    if (player.dashT > 0) { player.dashT -= STEP; sp = player.speed * 2.2; }
+  }
+  if (target) {
+    const d = dist(player.x, player.y, target.x, target.y);
+    if (d > 1) {
+      const vx = (target.x - player.x) / d, vy = (target.y - player.y) / d;
+      player.x += vx * sp * STEP;
+      player.y += vy * sp * STEP;
+      player.angle = Math.atan2(vy, vx);
+    }
+  }
+  player.x = clamp(player.x, AX + player.r, AX + AS - player.r);
+  player.y = clamp(player.y, AY + player.r, AY + AS - player.r);
+  if (player.flash > 0) player.flash--;
+  if (player.invuln > 0) player.invuln--;
+
+  // collect stars
+  for (const s of stars) {
+    if (s.taken) continue;
+    if (dist(player.x, player.y, s.x, s.y) < 44) {
+      s.taken = true;
+      collected++;
+      combo++; comboT = 3;
+      mult = (combo > 0 ? 1 + combo * 0.1 : 1) * (px2.taken && gameTime <= px2.until ? 2 : 1);
+      score += Math.round(100 * mult);
+      beep(520 + combo * 40, 0.12);
+      if (VERSION === 2) {
+        for (let i = 0; i < 12; i++) {
+          const a = rng() * Math.PI * 2, v = 60 + rng() * 160;
+          particles.push({ x: s.x, y: s.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.5, max: 0.5 });
+        }
+      }
+    }
+  }
+  // next wave when the arena is cleared
+  if (stars.every(s => s.taken)) {
+    wave++;
+    stars = starWave(STAR_COUNT);
+  }
+
+  // power-up pickup
+  if (VERSION === 2) {
+    for (const p of powerups) {
+      if (p.active && !p.taken && dist(player.x, player.y, p.x, p.y) < 46) {
+        p.taken = true; p.active = false;
+        if (p.kind === '2X') { p.until = gameTime + 10; mult *= 2; beep(880, 0.2); }
+        else { shield = true; beep(660, 0.2); }
+      }
+    }
+  }
+
+  // chasers home in on the player, same rule every frame
+  for (const c of chasers) {
+    const d = dist(c.x, c.y, player.x, player.y);
+    if (d > 1) {
+      c.x += (player.x - c.x) / d * c.speed * STEP;
+      c.y += (player.y - c.y) / d * c.speed * STEP;
+    }
+    if (c.flash > 0) c.flash--;
+    if (d < 50 && player.invuln <= 0) {
+      hits++;
+      if (shield) { shield = false; }
+      else { score = Math.max(0, score - 25); combo = 0; mult = 1; }
+      player.invuln = 60; player.flash = 30;
+      c.x = CHASER_SPAWNS[c.spawn].x; c.y = CHASER_SPAWNS[c.spawn].y;
+      beep(180, 0.25);
+    }
+  }
+
+  // particles
+  if (VERSION === 2) {
+    for (const p of particles) {
+      p.x += p.vx * STEP; p.y += p.vy * STEP; p.life -= STEP;
+    }
+    particles = particles.filter(p => p.life > 0);
+  }
+}
+
+function drawStar(x, y, r, color, pulse) {
+  const s = r * (1 + 0.12 * Math.sin(gameTime * 4 + pulse));
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    const rr = i % 2 === 0 ? s : s * 0.45;
+    const px = x + Math.cos(a) * rr, py = y + Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fill();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  // background
+  ctx.fillStyle = VERSION === 2 ? '#0a0f24' : '#0b1020';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  if (FOLLOW_CAM) {
+    // zoom 1.6x, centred on the player, clamped to the arena
+    const z = 1.6, cx = W / 2, cy = 980;
+    const px = clamp(player.x, AX + W / (2 * z), AX + AS - W / (2 * z));
+    const py = clamp(player.y, AY + H / (2 * z) - 220, AY + AS - H / (2 * z) + 220);
+    ctx.translate(cx, cy);
+    ctx.scale(z, z);
+    ctx.translate(-px, -py);
+  }
+
+  // arena floor
+  if (VERSION === 2) {
+    const tile = 100;
+    for (let ty = 0; ty < 10; ty++) {
+      for (let tx = 0; tx < 10; tx++) {
+        ctx.fillStyle = (tx + ty) % 2 === 0 ? '#141b36' : '#182040';
+        ctx.fillRect(AX + tx * tile, AY + ty * tile, tile, tile);
+      }
+    }
+  } else {
+    ctx.fillStyle = '#111831';
+    ctx.fillRect(AX, AY, AS, AS);
+    ctx.strokeStyle = '#1c2440'; ctx.lineWidth = 2;
+    for (let i = 1; i < 10; i++) {
+      ctx.beginPath(); ctx.moveTo(AX + i * 100, AY); ctx.lineTo(AX + i * 100, AY + AS); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(AX, AY + i * 100); ctx.lineTo(AX + AS, AY + i * 100); ctx.stroke();
+    }
+  }
+  // arena border
+  ctx.strokeStyle = VERSION === 2 ? '#22d3ee' : '#2a3352';
+  ctx.lineWidth = VERSION === 2 ? 6 : 4;
+  ctx.strokeRect(AX, AY, AS, AS);
+
+  // decor (v2)
+  if (VERSION === 2) {
+    for (const d of decor) {
+      ctx.fillStyle = d.c < 0.5 ? 'rgba(34,211,238,0.35)' : 'rgba(168,85,247,0.35)';
+      ctx.beginPath();
+      ctx.moveTo(d.x, d.y - d.s); ctx.lineTo(d.x + d.s * 0.7, d.y); ctx.lineTo(d.x, d.y + d.s); ctx.lineTo(d.x - d.s * 0.7, d.y);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  // power-ups (v2)
+  if (VERSION === 2) {
+    for (const p of powerups) {
+      if (!p.active) continue;
+      ctx.fillStyle = p.kind === '2X' ? '#22c55e' : '#3b82f6';
+      ctx.beginPath(); ctx.arc(p.x, p.y, 26, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 22px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(p.kind === '2X' ? '2X' : 'SH', p.x, p.y + 1);
+    }
+  }
+
+  // stars
+  for (const s of stars) {
+    if (s.taken) continue;
+    const col = VERSION === 2 ? (s.hue < 0.7 ? '#facc15' : '#f472b6') : '#facc15';
+    drawStar(s.x, s.y, s.r, col, s.pulse);
+  }
+
+  // particles (v2)
+  if (VERSION === 2) {
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = '#fde68a';
+      ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // chasers
+  for (let i = 0; i < chasers.length; i++) {
+    const c = chasers[i];
+    ctx.fillStyle = CHASER_COLORS[i];
+    ctx.beginPath(); ctx.arc(c.x, c.y, 26, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.beginPath(); ctx.arc(c.x - 8, c.y - 6, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(c.x + 8, c.y - 6, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(c.x, c.y + 4, 10, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  }
+
+  // player (triangle ship, cyan; flashes white after a hit)
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  ctx.rotate(player.angle);
+  ctx.fillStyle = player.flash > 0 && (frame % 6 < 3) ? '#ffffff' : '#22d3ee';
+  ctx.beginPath();
+  ctx.moveTo(26, 0); ctx.lineTo(-18, -16); ctx.lineTo(-10, 0); ctx.lineTo(-18, 16);
+  ctx.closePath(); ctx.fill();
+  if (VERSION === 2 && player.dashT > 0) {
+    ctx.strokeStyle = 'rgba(34,211,238,0.7)'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(-18, -10); ctx.lineTo(-44, 0); ctx.lineTo(-18, 10); ctx.stroke();
+  }
+  ctx.restore();
+  // shield ring
+  if (shield) {
+    ctx.strokeStyle = 'rgba(59,130,246,0.9)'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(player.x, player.y, 34, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+
+  // ---- HUD (always drawn in screen space, never zoomed) ----
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 64px monospace';
+  ctx.fillText('SPARK DASH', 48, 108);
+  ctx.font = 'bold 44px monospace';
+  ctx.fillStyle = VERSION === 2 ? '#22d3ee' : '#94a3b8';
+  ctx.textAlign = 'right';
+  ctx.fillText(VERSION === 2 ? 'DAY SEVEN' : 'DAY ONE', W - 48, 104);
+  ctx.textAlign = 'left';
+
+  ctx.font = 'bold 84px monospace';
+  ctx.fillStyle = '#facc15';
+  ctx.fillText(String(score), 48, 220);
+  ctx.font = 'bold 36px monospace';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.fillText('SCORE', 48, 268);
+  ctx.textAlign = 'right';
+  ctx.fillText('STARS ' + collected, W - 48, 220);
+  ctx.fillText('TIME ' + Math.floor(gameTime) + 's', W - 48, 268);
+  ctx.textAlign = 'left';
+  // COMBO / 2X go in the free centre column of the top band (x 450..780):
+  // left of it are the title, score and the make.fun badge, right of it
+  // the day label and STARS/TIME. Centred at 615 they touch nothing.
+  if (VERSION === 2 && combo >= 2) {
+    ctx.fillStyle = '#f472b6';
+    ctx.font = 'bold 52px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('COMBO x' + combo, 615, 200);
+  }
+  if (VERSION === 2 && mult >= 2) {
+    ctx.fillStyle = '#22c55e';
+    ctx.font = 'bold 52px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('2X ACTIVE', 615, 280);
+  }
+  ctx.textAlign = 'left';
+
+  // bottom band: week progress
+  ctx.font = 'bold 36px monospace';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText(VERSION === 2 ? 'ONE WEEK OF DAILY UPDATES' : 'BUILT TODAY — MORE COMING', 48, 1520);
+  for (let d = 0; d < 7; d++) {
+    const filled = VERSION === 2 ? true : d === 0;
+    ctx.fillStyle = filled ? '#22d3ee' : '#1e293b';
+    ctx.beginPath(); ctx.arc(72 + d * 64, 1600, 20, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = filled ? '#0a0f24' : '#64748b';
+    ctx.font = 'bold 22px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(String(d + 1), 72 + d * 64, 1608);
+    ctx.textAlign = 'left';
+  }
+  ctx.fillStyle = '#64748b';
+  ctx.font = '32px monospace';
+  ctx.fillText('an AI agent built this game — and kept updating it', 48, 1700);
+  ctx.fillText('same map. same start. one week apart.', 48, 1752);
+  if (VERSION === 2) {
+    ctx.fillStyle = '#22d3ee';
+    ctx.fillText('dash · combo · power-ups · particles · sound', 48, 1832);
+  } else {
+    ctx.fillStyle = '#475569';
+    ctx.fillText('5 stars · 1 chaser · bare arena', 48, 1832);
+  }
+}
+
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  acc += dt;
+  while (acc >= STEP) { update(); acc -= STEP; }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// expose state for the recording script to verify determinism
+window.__spark = {
+  get frame() { return frame; },
+  get time() { return gameTime; },
+  get score() { return score; },
+  get collected() { return collected; },
+  get version() { return VERSION; }
+};
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
